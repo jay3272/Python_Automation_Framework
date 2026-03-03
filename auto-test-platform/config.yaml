@@ -1,0 +1,25 @@
+# Auto-Test Platform Configuration
+# All values here can be overridden via CLI flags or the ATP_CONFIG env var.
+
+runner:
+  workers: 4          # number of parallel test workers
+  timeout: 120        # per-test timeout in seconds (null = no timeout)
+  use_processes: false # true = ProcessPoolExecutor, false = ThreadPoolExecutor
+
+report:
+  output_dir: reports  # directory for HTML & JSON reports
+  filename: report.html
+
+server:
+  url: null            # set to e.g. "http://localhost:5000" to push results
+  port: 5000
+  max_runs: 100        # in-memory result buffer size
+
+retry:
+  max_attempts: 3
+  delay: 0.5           # initial back-off delay in seconds
+  backoff: 2.0         # exponential multiplier
+  jitter: 0.1          # fraction of delay added as random jitter
+
+logging:
+  level: INFO
