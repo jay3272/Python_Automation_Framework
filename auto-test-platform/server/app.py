@@ -14,20 +14,39 @@ Run
     gunicorn -w 2 -b 0.0.0.0:5000 "server.app:create_app()"
 """
 
-import json
 import logging
 import os
+import sys
 from collections import deque
 from datetime import datetime, timezone
-from typing import Dict, List
+from pathlib import Path
+from threading import Lock
+from time import monotonic
+from typing import Dict
 
 from flask import Flask, jsonify, request, Response
+
+# Allow running `python server/app.py` from project root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core.station_simulator import StationSimulator
 
 logger = logging.getLogger(__name__)
 
 # In-memory store — replace with a database for production use
 _MAX_RUNS = int(os.environ.get("ATP_MAX_RUNS", 100))
 _results_store: deque = deque(maxlen=_MAX_RUNS)
+
+# In-memory station telemetry simulation
+_STATION_COUNT = int(os.environ.get("ATP_STATION_COUNT", 10))
+_STATION_UPDATE_SEC = float(os.environ.get("ATP_STATION_UPDATE_SEC", 2.0))
+_station_simulator = StationSimulator(station_count=_STATION_COUNT)
+_station_lock = Lock()
+_station_cache = {
+    "generated_at": datetime.now(timezone.utc).isoformat(),
+    "stations": _station_simulator.snapshot(),
+    "_last_tick": monotonic(),
+}
 
 # ---------------------------------------------------------------------------
 # Dashboard HTML (single-file, no external CDN required)
@@ -38,7 +57,7 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Auto-Test Platform — Dashboard</title>
+  <title>Auto-Test Platform - Dashboard</title>
   <style>
     * {{ box-sizing: border-box; }}
     body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -65,7 +84,25 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     .failed  {{ background: #5c1a1a; color: #e74c3c; }}
     .error   {{ background: #5c3a1a; color: #e67e22; }}
     .skipped {{ background: #3a3a3a; color: #95a5a6; }}
+    .idle    {{ background: #5a4a1b; color: #f1c40f; }}
+    .running {{ background: #1a5c38; color: #2ecc71; }}
+    .warning {{ background: #5c3a1a; color: #e67e22; }}
+    .offline {{ background: #3a3a3a; color: #95a5a6; }}
     .refresh {{ float: right; color: #aaa; font-size: .85em; margin-top: 6px; }}
+    .stations {{ margin-top: 32px; }}
+    .stations-grid {{ display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); margin-bottom: 20px; }}
+    .station-card {{ background: #16213e; border-radius: 10px; padding: 14px 16px; text-align: center; }}
+    .station-card .num {{ font-size: 1.8em; font-weight: bold; }}
+    .station-card .lbl {{ font-size: .8em; color: #aaa; margin-top: 4px; }}
+    .status-idle {{ color: #f1c40f; }}
+    .status-running {{ color: #2ecc71; }}
+    .status-warning {{ color: #e67e22; }}
+    .status-offline {{ color: #95a5a6; }}
+    .muted {{ color: #aaa; font-size: .85em; }}
+    @media (max-width: 740px) {{
+      header, main {{ padding-left: 16px; padding-right: 16px; }}
+      th, td {{ padding: 8px; }}
+    }}
   </style>
   <script>
     // Auto-refresh every 30 seconds
@@ -77,6 +114,7 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   <h1>🧪 Auto-Test Platform Dashboard</h1>
 </header>
 <main>
+  <h2>Test Result Overview <span class="refresh">auto-refreshes every 30 s</span></h2>
   <div class="cards">
     <div class="card"><div class="num">{total}</div><div class="lbl">Total Runs</div></div>
     <div class="card"><div class="num green">{passed}</div><div class="lbl">Passed</div></div>
@@ -85,7 +123,7 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     <div class="card"><div class="num grey">{skipped}</div><div class="lbl">Skipped</div></div>
   </div>
 
-  <h2>Recent Results <span class="refresh">auto-refreshes every 30 s</span></h2>
+  <h2>Recent Results</h2>
   <table>
     <thead>
       <tr>
@@ -97,6 +135,28 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
       {rows}
     </tbody>
   </table>
+
+  <div class="stations">
+    <h2>Station Monitoring <span class="muted">latest update: {station_generated_at}</span></h2>
+    <div class="stations-grid">
+      <div class="station-card"><div class="num">{station_total}</div><div class="lbl">Stations</div></div>
+      <div class="station-card"><div class="num status-running">{station_running}</div><div class="lbl">Running</div></div>
+      <div class="station-card"><div class="num status-idle">{station_idle}</div><div class="lbl">Idle</div></div>
+      <div class="station-card"><div class="num status-warning">{station_warning}</div><div class="lbl">Warning</div></div>
+      <div class="station-card"><div class="num status-offline">{station_offline}</div><div class="lbl">Offline</div></div>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Station</th><th>Line</th><th>Status</th><th>Current Test</th>
+          <th>Temp (C)</th><th>Utilization (%)</th><th>Pass</th><th>Fail</th><th>Heartbeat</th>
+        </tr>
+      </thead>
+      <tbody>
+        {station_rows}
+      </tbody>
+    </table>
+  </div>
 </main>
 </body>
 </html>"""
@@ -111,6 +171,35 @@ _ROW = (
     "<td style='color:#aaa;font-style:italic'>{error}</td>"
     "</tr>"
 )
+
+_STATION_ROW = (
+    "<tr>"
+    "<td>{station_id}</td>"
+    "<td>{line}</td>"
+    "<td><span class='badge {status}'>{status_upper}</span></td>"
+    "<td>{current_test}</td>"
+    "<td>{temperature_c}</td>"
+    "<td>{utilization_pct}</td>"
+    "<td>{pass_count}</td>"
+    "<td>{fail_count}</td>"
+    "<td>{last_heartbeat}</td>"
+    "</tr>"
+)
+
+
+def _refresh_station_cache(force: bool = False) -> Dict:
+    """Update station telemetry at a fixed interval and return latest cache."""
+    with _station_lock:
+        elapsed = monotonic() - _station_cache["_last_tick"]
+        if force or elapsed >= _STATION_UPDATE_SEC:
+            _station_cache["stations"] = _station_simulator.tick()
+            _station_cache["generated_at"] = datetime.now(timezone.utc).isoformat()
+            _station_cache["_last_tick"] = monotonic()
+
+        return {
+            "generated_at": _station_cache["generated_at"],
+            "stations": [s.copy() for s in _station_cache["stations"]],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -166,14 +255,29 @@ def create_app() -> Flask:
         """Return all stored results as JSON."""
         return jsonify(list(_results_store)), 200
 
+    @app.get("/api/stations")
+    def api_stations():
+        """Return simulated station telemetry for dashboard monitoring."""
+        payload = _refresh_station_cache()
+        return jsonify(payload), 200
+
     @app.get("/")
     def dashboard():
         """Render the HTML dashboard."""
         results = list(_results_store)
+        station_payload = _refresh_station_cache()
+        stations = station_payload["stations"]
+
         counts = {"total": len(results), "passed": 0, "failed": 0, "error": 0, "skipped": 0}
         for r in results:
             s = r.get("status", "error")
             counts[s] = counts.get(s, 0) + 1
+
+        station_counts = {"idle": 0, "running": 0, "warning": 0, "offline": 0, "total": len(stations)}
+        for station in stations:
+            station_counts[station.get("status", "offline")] = (
+                station_counts.get(station.get("status", "offline"), 0) + 1
+            )
 
         rows_html = ""
         for idx, r in enumerate(reversed(results), start=1):
@@ -188,7 +292,33 @@ def create_app() -> Flask:
                 error=r.get("error") or "",
             )
 
-        html = _DASHBOARD_TEMPLATE.format(rows=rows_html, **counts)
+        station_rows_html = ""
+        for station in stations:
+            status = station.get("status", "offline")
+            station_rows_html += _STATION_ROW.format(
+                station_id=station.get("station_id", "-"),
+                line=station.get("line", "-"),
+                status=status,
+                status_upper=status.upper(),
+                current_test=station.get("current_test", "-"),
+                temperature_c=station.get("temperature_c", "-"),
+                utilization_pct=station.get("utilization_pct", "-"),
+                pass_count=station.get("pass_count", 0),
+                fail_count=station.get("fail_count", 0),
+                last_heartbeat=station.get("last_heartbeat", "-"),
+            )
+
+        html = _DASHBOARD_TEMPLATE.format(
+            rows=rows_html,
+            station_rows=station_rows_html,
+            station_generated_at=station_payload["generated_at"],
+            station_total=station_counts["total"],
+            station_running=station_counts["running"],
+            station_idle=station_counts["idle"],
+            station_warning=station_counts["warning"],
+            station_offline=station_counts["offline"],
+            **counts,
+        )
         return Response(html, mimetype="text/html")
 
     return app

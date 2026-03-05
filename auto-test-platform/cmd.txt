@@ -10,7 +10,42 @@ python main.py
 python server/app.py
 # 瀏覽 http://localhost:5000
 
+# 模擬 10 個測試站台並監控資訊
+export ATP_STATION_COUNT=10
+python server/app.py
+# 監控 API: http://localhost:5000/api/stations
+# CLI 檢視:
+curl -s http://localhost:5000/api/stations
+
 用 Docker 執行：
 cd /workspaces/Python_Automation_Framework/auto-test-platform
 docker build -t auto-test-platform .
 docker run --rm auto-test-platform
+
+----------------------------------
+1.建立環境與安裝套件（只要第一次）
+cd /workspaces/Python_Automation_Framework/auto-test-platform
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+2.跑測試程式（主程式）
+cd /workspaces/Python_Automation_Framework/auto-test-platform
+source .venv/bin/activate
+python main.py
+
+3.跑 Dashboard（另一個 Terminal）
+cd /workspaces/Python_Automation_Framework/auto-test-platform
+source .venv/bin/activate
+export ATP_STATION_COUNT=10
+python server/app.py
+
+4.打開 Dashboard
+# 瀏覽器開
+http://localhost:5000
+
+5.查看站台監控 API（可選）
+curl -s http://localhost:5000/api/stations
+
+如果你想讓 main.py 跑完自動把測試結果送到 Dashboard，再用這個指令跑測試：
+python main.py --server-url http://localhost:5000
