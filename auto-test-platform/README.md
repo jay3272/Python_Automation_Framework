@@ -4,6 +4,8 @@ A lightweight Python automation testing framework that supports parallel
 test execution, configurable retry logic, HTML/JSON reporting, and a
 centralised result-collection dashboard.
 
+Technical documentation: `TECHNICAL_DOCUMENTATION.md`
+
 ## Architecture
 
 The platform is split into three layers so test execution, reporting, and
