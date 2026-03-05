@@ -1,0 +1,16 @@
+cd /workspaces/Python_Automation_Framework/auto-test-platform
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# 執行自動化測試主程式
+python main.py
+
+# （可選）啟動 Dashboard
+python server/app.py
+# 瀏覽 http://localhost:5000
+
+用 Docker 執行：
+cd /workspaces/Python_Automation_Framework/auto-test-platform
+docker build -t auto-test-platform .
+docker run --rm auto-test-platform
