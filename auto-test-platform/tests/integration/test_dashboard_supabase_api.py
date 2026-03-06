@@ -34,3 +34,38 @@ def test_api_results_uses_supabase_when_env_present(monkeypatch):
     assert isinstance(payload, list)
     assert payload[0]["name"] == "db_test_case"
     assert payload[0]["status"] == "passed"
+
+
+def test_supabase_get_uses_connection_module(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "dummy-key")
+    monkeypatch.setenv("SUPABASE_SCHEMA", "public")
+
+    capture = {"request": None}
+
+    class _FakeConnection:
+        def __init__(self, supabase_url, service_role_key, schema="public", timeout_sec=10.0):
+            assert supabase_url == "https://example.supabase.co"
+            assert service_role_key == "dummy-key"
+            assert schema == "public"
+
+        def get_json(self, table, query=None, timeout_sec=10):
+            capture["table"] = table
+            capture["query"] = query
+            capture["timeout"] = timeout_sec
+            capture["request"] = "via-module"
+            return [{"test_name": "smoke"}]
+
+    monkeypatch.setattr(app_module, "SupabaseRestConnection", _FakeConnection)
+
+    payload = app_module._supabase_get(
+        "v_recent_test_results",
+        {"select": "test_name", "limit": "1"},
+    )
+
+    assert capture["table"] == "v_recent_test_results"
+    assert capture["query"]["select"] == "test_name"
+    assert capture["request"] == "via-module"
+    assert capture["timeout"] == 10
+    assert isinstance(payload, list)
+    assert payload[0]["test_name"] == "smoke"

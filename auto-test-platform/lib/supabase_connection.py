@@ -26,6 +26,7 @@ Database connection helper:
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import urllib.parse
 import urllib.request
@@ -81,6 +82,29 @@ class SupabaseRestConnection:
             "Accept-Profile": self.schema,
             "Content-Profile": self.schema,
         }
+
+    def build_get_request(self, table: str, query: dict | None = None):
+        """Create a configured GET request for Supabase REST reads."""
+        return urllib.request.Request(
+            self.table_endpoint(table=table, query=query),
+            method="GET",
+            headers={
+                "apikey": self.service_role_key,
+                "Authorization": f"Bearer {self.service_role_key}",
+                "Accept-Profile": self.schema,
+            },
+        )
+
+    def get_json(self, table: str, query: dict | None = None, timeout_sec: float | None = None) -> list:
+        """Execute a REST GET and return list payload; non-list payloads map to empty list."""
+        req = self.build_get_request(table=table, query=query)
+        timeout = self.timeout_sec if timeout_sec is None else timeout_sec
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read().decode("utf-8").strip()
+            if not body:
+                return []
+            payload = json.loads(body)
+            return payload if isinstance(payload, list) else []
 
     def build_post_request(self, table: str, payload: bytes, query: dict | None = None, prefer: str = "return=minimal"):
         """Create a configured POST request object for Supabase REST."""

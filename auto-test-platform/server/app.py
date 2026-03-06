@@ -17,9 +17,6 @@ Run
 import logging
 import os
 import sys
-import json
-import urllib.parse
-import urllib.request
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +30,7 @@ from flask import Flask, jsonify, request, Response
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.station_simulator import StationSimulator
+from lib.supabase_connection import SupabaseRestConnection
 
 logger = logging.getLogger(__name__)
 
@@ -204,28 +202,25 @@ def _supabase_config() -> Dict[str, str]:
   }
 
 
-def _supabase_get(path: str, query: Dict[str, str]) -> list:
-  """Perform a GET request to Supabase REST and return JSON list payload."""
+def _supabase_connection() -> SupabaseRestConnection | None:
+  """Build Supabase REST connection object from environment config."""
   cfg = _supabase_config()
   if not cfg:
+    return None
+  return SupabaseRestConnection(
+    supabase_url=cfg["url"],
+    service_role_key=cfg["key"],
+    schema=cfg["schema"],
+  )
+
+
+def _supabase_get(path: str, query: Dict[str, str]) -> list:
+  """Perform a GET request to Supabase REST and return JSON list payload."""
+  connection = _supabase_connection()
+  if connection is None:
     raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not configured")
 
-  endpoint = f"{cfg['url']}/rest/v1/{path}?{urllib.parse.urlencode(query)}"
-  req = urllib.request.Request(
-    endpoint,
-    method="GET",
-    headers={
-      "apikey": cfg["key"],
-      "Authorization": f"Bearer {cfg['key']}",
-      "Accept-Profile": cfg["schema"],
-    },
-  )
-  with urllib.request.urlopen(req, timeout=10) as resp:
-    body = resp.read().decode("utf-8").strip()
-    if not body:
-      return []
-    payload = json.loads(body)
-    return payload if isinstance(payload, list) else []
+  return connection.get_json(table=path, query=query, timeout_sec=10)
 
 
 def _fetch_results_from_supabase(limit: int = 200) -> list:

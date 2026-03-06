@@ -44,6 +44,21 @@ def test_rest_connection_builds_endpoint_and_headers():
     assert headers["Accept-Profile"] == "public"
 
 
+def test_rest_connection_builds_get_request():
+    conn = mod.SupabaseRestConnection(
+        supabase_url="https://example.supabase.co/",
+        service_role_key="test-key",
+        schema="public",
+    )
+
+    req = conn.build_get_request("v_recent_test_results", {"limit": "10"})
+
+    assert req.method == "GET"
+    assert req.full_url == "https://example.supabase.co/rest/v1/v_recent_test_results?limit=10"
+    assert req.headers["Apikey"] == "test-key"
+    assert req.headers["Accept-profile"] == "public"
+
+
 def test_rest_connection_rejects_invalid_input():
     try:
         mod.SupabaseRestConnection("", "key")
