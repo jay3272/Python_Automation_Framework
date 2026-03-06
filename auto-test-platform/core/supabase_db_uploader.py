@@ -2,31 +2,22 @@
 
 import asyncio
 import json
-import re
 from typing import Sequence
 
 from core.base_test import TestResult
-
-try:
-    import asyncpg
-except ImportError:  # pragma: no cover
-    asyncpg = None
-
-
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+from lib.supabase_connection import SupabaseDatabaseConnection
 
 
 class SupabaseDbUploader:
     """Upload test run and result rows directly into Supabase Postgres."""
 
     def __init__(self, database_url: str, schema: str = "public", timeout_sec: float = 15.0):
-        if asyncpg is None:
-            raise RuntimeError("asyncpg is required for DATABASE_URL uploads. Install asyncpg first.")
-        if not _IDENTIFIER_RE.match(schema):
-            raise ValueError(f"Invalid schema name: {schema!r}")
-        self._database_url = database_url
+        self._connection = SupabaseDatabaseConnection(
+            database_url=database_url,
+            schema=schema,
+            timeout_sec=timeout_sec,
+        )
         self._schema = schema
-        self._timeout_sec = timeout_sec
 
     def upload_run_results(
         self,
@@ -54,7 +45,7 @@ class SupabaseDbUploader:
         asyncio.run(self._ping())
 
     async def _ping(self) -> None:
-        conn = await asyncpg.connect(dsn=self._database_url, timeout=self._timeout_sec)
+        conn = await self._connection.connect()
         try:
             await conn.execute("SELECT 1;")
             await conn.execute(f"SELECT 1 FROM {self._schema}.test_runs LIMIT 1;")
@@ -70,7 +61,7 @@ class SupabaseDbUploader:
         summary: dict,
         results: Sequence[TestResult],
     ) -> str:
-        conn = await asyncpg.connect(dsn=self._database_url, timeout=self._timeout_sec)
+        conn = await self._connection.connect()
         run_sql = f"""
             INSERT INTO {self._schema}.test_runs (run_id, station_id, started_at, ended_at, summary_json)
             VALUES ($1, $2, $3::timestamptz, $4::timestamptz, $5::jsonb)

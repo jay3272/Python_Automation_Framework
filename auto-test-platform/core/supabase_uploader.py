@@ -2,10 +2,10 @@
 
 import json
 from typing import Sequence
-import urllib.parse
 import urllib.request
 
 from core.base_test import TestResult
+from lib.supabase_connection import SupabaseRestConnection
 
 
 class SupabaseUploader:
@@ -18,9 +18,12 @@ class SupabaseUploader:
         schema: str = "public",
         timeout_sec: float = 10.0,
     ):
-        self._base_url = supabase_url.rstrip("/") + "/rest/v1"
-        self._service_role_key = service_role_key
-        self._schema = schema
+        self._connection = SupabaseRestConnection(
+            supabase_url=supabase_url,
+            service_role_key=service_role_key,
+            schema=schema,
+            timeout_sec=timeout_sec,
+        )
         self._timeout_sec = timeout_sec
 
     def upload_run_results(
@@ -68,23 +71,12 @@ class SupabaseUploader:
         return db_run_id
 
     def _post(self, table: str, rows: list, query: dict | None = None, prefer: str = "return=minimal"):
-        endpoint = f"{self._base_url}/{table}"
-        if query:
-            endpoint += "?" + urllib.parse.urlencode(query)
-
         payload = json.dumps(rows).encode("utf-8")
-        req = urllib.request.Request(
-            endpoint,
-            data=payload,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "apikey": self._service_role_key,
-                "Authorization": f"Bearer {self._service_role_key}",
-                "Prefer": prefer,
-                "Accept-Profile": self._schema,
-                "Content-Profile": self._schema,
-            },
+        req = self._connection.build_post_request(
+            table=table,
+            payload=payload,
+            query=query,
+            prefer=prefer,
         )
 
         with urllib.request.urlopen(req, timeout=self._timeout_sec) as response:
