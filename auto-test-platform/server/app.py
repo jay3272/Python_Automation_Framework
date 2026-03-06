@@ -17,6 +17,9 @@ Run
 import logging
 import os
 import sys
+import json
+import urllib.parse
+import urllib.request
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -187,6 +190,119 @@ _STATION_ROW = (
 )
 
 
+def _supabase_config() -> Dict[str, str]:
+  """Return Supabase REST config if available via environment variables."""
+  url = os.environ.get("SUPABASE_URL", "").strip()
+  key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+  schema = os.environ.get("SUPABASE_SCHEMA", "public").strip() or "public"
+  if not url or not key:
+    return {}
+  return {
+    "url": url.rstrip("/"),
+    "key": key,
+    "schema": schema,
+  }
+
+
+def _supabase_get(path: str, query: Dict[str, str]) -> list:
+  """Perform a GET request to Supabase REST and return JSON list payload."""
+  cfg = _supabase_config()
+  if not cfg:
+    raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not configured")
+
+  endpoint = f"{cfg['url']}/rest/v1/{path}?{urllib.parse.urlencode(query)}"
+  req = urllib.request.Request(
+    endpoint,
+    method="GET",
+    headers={
+      "apikey": cfg["key"],
+      "Authorization": f"Bearer {cfg['key']}",
+      "Accept-Profile": cfg["schema"],
+    },
+  )
+  with urllib.request.urlopen(req, timeout=10) as resp:
+    body = resp.read().decode("utf-8").strip()
+    if not body:
+      return []
+    payload = json.loads(body)
+    return payload if isinstance(payload, list) else []
+
+
+def _fetch_results_from_supabase(limit: int = 200) -> list:
+  """Fetch recent test results from Supabase view and map to dashboard format."""
+  rows = _supabase_get(
+    "v_recent_test_results",
+    {
+      "select": "test_name,status,duration_sec,error_text,received_at",
+      "order": "received_at.desc",
+      "limit": str(limit),
+    },
+  )
+  return [
+    {
+      "name": row.get("test_name", "-"),
+      "status": row.get("status", "error"),
+      "duration": float(row.get("duration_sec", 0) or 0),
+      "error": row.get("error_text"),
+      "_received_at": row.get("received_at", "-"),
+    }
+    for row in rows
+  ]
+
+
+def _fetch_stations_from_supabase(limit: int = 200) -> Dict:
+  """Fetch latest station telemetry from Supabase view and map to API format."""
+  rows = _supabase_get(
+    "v_latest_station_status",
+    {
+      "select": (
+        "station_id,line,status,current_test,temperature_c,"
+        "utilization_pct,pass_count,fail_count,heartbeat_at"
+      ),
+      "order": "heartbeat_at.desc",
+      "limit": str(limit),
+    },
+  )
+  stations = [
+    {
+      "station_id": row.get("station_id", "-"),
+      "line": row.get("line", "-"),
+      "status": row.get("status", "offline"),
+      "current_test": row.get("current_test", "-"),
+      "temperature_c": row.get("temperature_c", "-"),
+      "utilization_pct": row.get("utilization_pct", "-"),
+      "pass_count": row.get("pass_count", 0),
+      "fail_count": row.get("fail_count", 0),
+      "last_heartbeat": row.get("heartbeat_at", "-"),
+    }
+    for row in rows
+  ]
+  return {
+    "generated_at": datetime.now(timezone.utc).isoformat(),
+    "stations": stations,
+  }
+
+
+def _load_results_for_dashboard() -> list:
+  """Return results from Supabase when configured, otherwise from in-memory store."""
+  try:
+    return _fetch_results_from_supabase(limit=300)
+  except Exception as exc:  # pylint: disable=broad-except
+    if _supabase_config():
+      logger.warning("Supabase results fetch failed, fallback to memory store — %s", exc)
+    return list(_results_store)
+
+
+def _load_stations_for_dashboard() -> Dict:
+  """Return station telemetry from Supabase when configured, otherwise simulator."""
+  try:
+    return _fetch_stations_from_supabase(limit=200)
+  except Exception as exc:  # pylint: disable=broad-except
+    if _supabase_config():
+      logger.warning("Supabase stations fetch failed, fallback to simulator — %s", exc)
+    return _refresh_station_cache()
+
+
 def _refresh_station_cache(force: bool = False) -> Dict:
     """Update station telemetry at a fixed interval and return latest cache."""
     with _station_lock:
@@ -253,19 +369,19 @@ def create_app() -> Flask:
     @app.get("/api/results")
     def api_results():
         """Return all stored results as JSON."""
-        return jsonify(list(_results_store)), 200
+        return jsonify(_load_results_for_dashboard()), 200
 
     @app.get("/api/stations")
     def api_stations():
         """Return simulated station telemetry for dashboard monitoring."""
-        payload = _refresh_station_cache()
+        payload = _load_stations_for_dashboard()
         return jsonify(payload), 200
 
     @app.get("/")
     def dashboard():
         """Render the HTML dashboard."""
-        results = list(_results_store)
-        station_payload = _refresh_station_cache()
+        results = _load_results_for_dashboard()
+        station_payload = _load_stations_for_dashboard()
         stations = station_payload["stations"]
 
         counts = {"total": len(results), "passed": 0, "failed": 0, "error": 0, "skipped": 0}

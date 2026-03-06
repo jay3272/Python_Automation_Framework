@@ -1,116 +1,168 @@
 # Auto-Test Platform
 
-A lightweight Python automation testing framework that supports parallel
-test execution, configurable retry logic, HTML/JSON reporting, and a
-centralised result-collection dashboard.
+一個輕量的 Python 自動化測試框架，支援平行測試執行、可設定重試策略、
+HTML/JSON 報表，以及集中式測試結果儀表板。
 
-Technical documentation: `TECHNICAL_DOCUMENTATION.md`
+技術文件：`TECHNICAL_DOCUMENTATION.md`
 
-## Architecture
+## 架構總覽
 
-The platform is split into three layers so test execution, reporting, and
-monitoring can evolve independently.
+平台分成三層，讓測試執行、報表輸出、監控展示可以各自演進。
 
-1. Test Execution Layer (`core/` + `main.py`)
-- `BaseTest` defines the lifecycle (`setup -> execute -> teardown`) and outputs `TestResult`.
-- `Runner` executes discovered tests in parallel and aggregates statuses.
-- `retry` provides retry/backoff for flaky operations.
-- `main.py` discovers tests, executes them, writes reports, and optionally posts to server.
+1. 測試執行層（`core/` + `main.py`）
+- `BaseTest` 定義測試生命週期（`setup -> execute -> teardown`）並輸出 `TestResult`。
+- `Runner` 平行執行測試並彙整結果。
+- `retry` 提供 flaky 操作的重試與退避（backoff）。
+- `main.py` 負責測試探索、執行、產出報表，並可選擇上拋結果到伺服器。
 
-2. Reporting Layer (`core/report.py` + `reports/`)
-- `Reporter` converts runtime results into `report.html` and `report.json`.
-- JSON output is CI/server-friendly; HTML is for local inspection.
+2. 報表層（`core/report.py` + `reports/`）
+- `Reporter` 將執行結果輸出成 `report.html` 與 `report.json`。
+- JSON 適合 CI 與系統串接，HTML 適合人工檢視。
 
-3. Monitoring Layer (`server/app.py` + `core/station_simulator.py`)
-- Flask server exposes:
-    - `POST /results`: ingest test results from runner/CI.
-    - `GET /api/results`: fetch collected test results.
-    - `GET /api/stations`: fetch simulated station telemetry (default 10 stations).
-    - `GET /`: dashboard view for both test results and station monitoring.
-- `StationSimulator` keeps in-memory station state and updates status/metrics on each tick.
+3. 監控層（`server/app.py` + `core/station_simulator.py`）
+- Flask 服務提供：
+  - `POST /results`：接收 runner/CI 上拋的測試結果。
+  - `GET /api/results`：回傳收集到的測試結果。
+  - `GET /api/stations`：回傳測試站遙測資料（預設 10 站，模擬）。
+  - `GET /`：顯示測試結果與測試站監控儀表板。
+- `StationSimulator` 目前以記憶體模擬站點狀態，並在每次更新時刷新指標。
 
-### Runtime Flow
+### 執行流程
 
-1. `python main.py` discovers classes under `tests/` that inherit from `BaseTest`.
-2. `Runner` runs tests concurrently and returns `TestResult` list.
-3. `Reporter` generates HTML/JSON artifacts in `reports/`.
-4. If `--server-url` is set, results are posted to `POST /results`.
-5. Dashboard aggregates stored results and station telemetry for monitoring.
+1. `python main.py` 會探索 `tests/` 底下所有繼承 `BaseTest` 的類別。
+2. `Runner` 以平行方式執行並回傳 `TestResult` 清單。
+3. `Reporter` 產出 `reports/` 下的 HTML/JSON 報表。
+4. 若設定 `--server-url`，會把結果送到 `POST /results`。
+5. Dashboard 彙整測試結果與測試站資訊供監控使用。
 
-### Station Monitoring Flow (10 Stations)
+### 測試站監控流程（預設 10 站）
 
-1. Server startup initializes `StationSimulator(station_count=10)` by default.
-2. On each dashboard/API request, station cache is refreshed at a fixed interval.
-3. Each station record includes:
-     `station_id`, `line`, `status`, `current_test`, `temperature_c`,
-     `utilization_pct`, `pass_count`, `fail_count`, `last_heartbeat`.
-4. Dashboard shows status counters (running/idle/warning/offline) and per-station table.
+1. 服務啟動時初始化 `StationSimulator(station_count=10)`。
+2. 每次儀表板或 API 被呼叫時，依固定間隔刷新站點快取。
+3. 站點資料包含：
+   `station_id`, `line`, `status`, `current_test`, `temperature_c`,
+   `utilization_pct`, `pass_count`, `fail_count`, `last_heartbeat`。
+4. Dashboard 顯示狀態統計（running/idle/warning/offline）與站點明細。
 
 ---
 
-## Project Structure
+## Supabase 整合架構（建議）
 
-```
+若你要讓「測試站上拋資料到 DB，Dashboard 從 DB 撈資料」，建議採用以下流程：
+
+1. 測試站（`main.py`）執行完成後，POST 一個完整 run payload 到 `POST /results`。
+2. 伺服器（`server/app.py`）做驗證與補欄位，再寫入 Supabase（Postgres）。
+3. Dashboard API（`/api/results`, `/api/stations`）改成查 Supabase，而非讀記憶體 `deque`。
+
+### 建議資料表
+
+1. `test_runs`
+- `id (uuid pk)`, `station_id`, `started_at`, `ended_at`, `summary_json`, `created_at`
+
+2. `test_results`
+- `id (uuid pk)`, `run_id (fk)`, `test_name`, `status`, `duration_sec`, `error_text`, `received_at`
+
+3. `station_telemetry`
+- `id (bigserial pk)`, `station_id`, `status`, `line`, `current_test`,
+  `temperature_c`, `utilization_pct`, `pass_count`, `fail_count`, `heartbeat_at`
+
+### 程式改造位置
+
+1. `main.py`
+- 上拋 payload 增加 `run_id`, `station_id`, `started_at`, `ended_at`, `summary`, `results`。
+
+2. `server/app.py`
+- `POST /results`：由記憶體儲存改為寫 Supabase。
+- `GET /api/results`：由記憶體讀取改為查 Supabase。
+- `GET /api/stations`：由模擬資料改為查最近 telemetry（可保留 fallback）。
+
+3. `config.yaml`
+- 建議新增：
+  - `supabase.url`
+  - `supabase.service_role_key_env`
+  - `supabase.schema`（可選）
+
+4. `requirements.txt`
+- 新增 `supabase` 套件。
+
+### 安全建議
+
+1. `service_role_key` 只放在後端環境變數，不能放前端。
+2. 前端若未來直連 Supabase，務必開啟 RLS 與唯讀 policy。
+3. 建議以 `run_id` 做冪等控制（避免重送造成重複寫入）。
+
+---
+
+## 專案結構
+
+```text
 auto-test-platform/
-│
-├── core/
-│   ├── base_test.py   # Template Method Pattern — base class for all tests
-│   ├── runner.py      # Parallel test runner (ThreadPool / ProcessPool)
-│   ├── retry.py       # Retry decorator & policy with exponential back-off
-│   ├── config.py      # YAML configuration loader
-│   ├── report.py      # HTML + JSON report generator
-│   └── station_simulator.py # Simulated station telemetry generator
-│
-├── tests/
-│   ├── unit/          # Unit tests for each core module
-│   ├── integration/   # Runner → Report pipeline tests
-│   ├── e2e/           # Full end-to-end scenario tests
-│   ├── unit/test_station_simulator.py
-│   └── integration/test_station_monitoring_api.py
-│
-├── server/
-│   └── app.py         # Flask dashboard + result-collection API
-│
-├── main.py            # CLI entry-point with test discovery
-├── config.yaml        # Default configuration
-├── requirements.txt
-├── Dockerfile
-└── .github/workflows/test.yml
+|
++-- core/
+|   +-- base_test.py           # Template Method: 測試基底類
+|   +-- runner.py              # 平行測試執行器（ThreadPool / ProcessPool）
+|   +-- retry.py               # 重試裝飾器與退避策略
+|   +-- config.py              # YAML 設定載入器
+|   +-- report.py              # HTML + JSON 報表生成器
+|   +-- station_simulator.py   # 測試站遙測模擬器
+|
++-- tests/
+|   +-- unit/                  # 核心模組單元測試
+|   +-- integration/           # Runner -> Report 等整合測試
+|   +-- e2e/                   # 端到端情境測試
+|   +-- unit/test_station_simulator.py
+|   +-- integration/test_station_monitoring_api.py
+|
++-- server/
+|   +-- app.py                 # Flask dashboard + 結果收集 API
+|
++-- main.py                    # CLI 入口（含測試探索）
++-- config.yaml                # 預設設定
++-- requirements.txt
++-- Dockerfile
++-- .github/workflows/test.yml
 ```
 
 ---
 
-## Quick Start
+## 快速開始
 
-### 1. Install dependencies
+### 1. 安裝相依套件
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Run all tests
+### 2. 執行全部測試
 
 ```bash
 cd auto-test-platform
+set -a
+source .env
+set +a
 python main.py
 ```
 
-Reports are written to `reports/report.html` and `reports/report.json`.
+報表會輸出到 `reports/report.html` 與 `reports/report.json`。
 
-### 3. Run with custom options
+### 3. 使用自訂參數執行
 
 ```bash
 python main.py --workers 8 --timeout 60 --report-dir /tmp/reports
 ```
 
-### 4. Start the dashboard server
+### 4. 啟動 Dashboard 伺服器
 
 ```bash
+cd /workspaces/Python_Automation_Framework/auto-test-platform
+set -a
+source .env
+set +a
 python server/app.py
-# Open http://localhost:5000
+# 開啟 http://localhost:5000
 ```
 
-### 5. Run with pytest
+### 5. 使用 pytest 跑測試
 
 ```bash
 pytest tests/ -v --tb=short
@@ -118,59 +170,60 @@ pytest tests/ -v --tb=short
 
 ---
 
-## Writing Tests
+## 如何撰寫測試
 
-Subclass `BaseTest` and implement the `execute()` method:
+繼承 `BaseTest` 並實作 `execute()`：
 
 ```python
 from core.base_test import BaseTest
 from core.retry import retry
 
+
 class MyTest(BaseTest):
     name = "my_test"
 
     def setup(self):
-        # optional: prepare resources
+        # 可選：測試前準備資源
         pass
 
     @retry(max_attempts=3, delay=0.2, exceptions=(IOError,))
     def execute(self):
-        # your test logic here
+        # 你的測試邏輯
         assert some_function() == expected_value
 
     def teardown(self):
-        # optional: clean up resources
+        # 可選：測試後清理
         pass
 
     def skip_condition(self) -> bool:
-        # optional: return True to skip
+        # 可選：回傳 True 會略過此測試
         return False
 ```
 
 ---
 
-## Configuration (`config.yaml`)
+## 設定檔（`config.yaml`）
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `runner.workers` | `4` | Parallel worker threads |
-| `runner.timeout` | `120` | Per-test timeout (seconds) |
-| `report.output_dir` | `reports` | Report output directory |
-| `server.url` | `null` | Result server URL (optional) |
-| `retry.max_attempts` | `3` | Default retry count |
+| 鍵值 | 預設值 | 說明 |
+|-----|--------|------|
+| `runner.workers` | `4` | 平行 worker 數量 |
+| `runner.timeout` | `120` | 單一測試逾時秒數 |
+| `report.output_dir` | `reports` | 報表輸出目錄 |
+| `server.url` | `null` | 結果收集伺服器 URL（選填） |
+| `retry.max_attempts` | `3` | 預設重試次數 |
 
 ---
 
 ## Docker
 
 ```bash
-# Build
+# 建置映像
 docker build -t auto-test-platform .
 
-# Run tests
+# 執行測試
 docker run --rm auto-test-platform
 
-# Run the dashboard server
+# 啟動 Dashboard 伺服器
 docker run -p 5000:5000 auto-test-platform python server/app.py
 ```
 
@@ -178,5 +231,4 @@ docker run -p 5000:5000 auto-test-platform python server/app.py
 
 ## CI / GitHub Actions
 
-The workflow at `.github/workflows/test.yml` automatically runs the full
-test suite on every push and pull request.
+`.github/workflows/test.yml` 會在每次 push / pull request 自動執行完整測試流程。

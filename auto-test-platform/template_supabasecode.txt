@@ -1,0 +1,152 @@
+# app.py
+# Python 3.9+ recommended
+import os
+import asyncio
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import asyncpg
+
+# Read DB URL from environment variable
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is not set")
+
+app = FastAPI(title="Test Automation API")
+
+# Global pool variable
+db_pool: Optional[asyncpg.pool.Pool] = None
+
+# Pydantic models for responses
+class StationStatus(BaseModel):
+    id: int
+    station_id: str
+    line: Optional[str]
+    status: str
+    current_test: Optional[str]
+    temperature_c: Optional[float]
+    utilization_pct: Optional[float]
+    pass_count: int
+    fail_count: int
+    heartbeat_at: str
+
+class TestResultItem(BaseModel):
+    result_id: str
+    run_id: str
+    test_name: str
+    status: str
+    duration_sec: float
+    error_text: Optional[str]
+    received_at: str
+    station_id: str
+    external_run_id: str
+    started_at: Optional[str]
+    ended_at: Optional[str]
+    summary_json: dict
+
+# Startup/shutdown events to initialize/close pool
+@app.on_event("startup")
+async def startup():
+    global db_pool
+    # Create a connection pool with asyncpg
+    db_pool = await asyncpg.create_pool(
+        dsn=DATABASE_URL,
+        min_size=1,
+        max_size=10,
+        max_inactive_connection_lifetime=300.0,
+        command_timeout=30,
+    )
+
+@app.on_event("shutdown")
+async def shutdown():
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+
+# Endpoint: get latest station statuses (from view v_latest_station_status)
+@app.get("/stations/latest", response_model=List[StationStatus])
+async def get_latest_stations(limit: int = 100):
+    if limit <= 0 or limit > 1000:
+        raise HTTPException(status_code=400, detail="limit must be 1..1000")
+    sql = """
+        SELECT id, station_id, line, status, current_test, temperature_c, utilization_pct,
+               pass_count, fail_count, heartbeat_at
+        FROM public.v_latest_station_status
+        ORDER BY heartbeat_at DESC
+        LIMIT $1;
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, limit)
+    results = [dict(r) for r in rows]
+    return results
+
+# Endpoint: get recent test results (from view v_recent_test_results)
+@app.get("/tests/recent", response_model=List[TestResultItem])
+async def get_recent_tests(limit: int = 100, station_id: Optional[str] = None):
+    if limit <= 0 or limit > 2000:
+        raise HTTPException(status_code=400, detail="limit must be 1..2000")
+    # Parameterize query depending on optional station_id
+    if station_id:
+        sql = """
+        SELECT result_id::text, run_id::text, test_name, status, duration_sec::float, error_text,
+               received_at::text, station_id, external_run_id, started_at::text, ended_at::text, summary_json
+        FROM public.v_recent_test_results
+        WHERE station_id = $1
+        ORDER BY received_at DESC
+        LIMIT $2;
+        """
+        params = (station_id, limit)
+    else:
+        sql = """
+        SELECT result_id::text, run_id::text, test_name, status, duration_sec::float, error_text,
+               received_at::text, station_id, external_run_id, started_at::text, ended_at::text, summary_json
+        FROM public.v_recent_test_results
+        ORDER BY received_at DESC
+        LIMIT $1;
+        """
+        params = (limit,)
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, *params)
+    results = [dict(r) for r in rows]
+    return results
+
+# Example write endpoint (secure): insert telemetry
+# NOTE: You should protect this endpoint (authentication + authorization).
+class TelemetryIn(BaseModel):
+    station_id: str
+    line: Optional[str]
+    status: str
+    current_test: Optional[str]
+    temperature_c: Optional[float]
+    utilization_pct: Optional[float]
+    pass_count: Optional[int] = 0
+    fail_count: Optional[int] = 0
+
+@app.post("/telemetry")
+async def post_telemetry(payload: TelemetryIn):
+    # This endpoint should require authentication & authorization in production.
+    # Here we perform a simple upsert into station_telemetry to avoid duplicate rapid inserts:
+    sql = """
+    INSERT INTO public.station_telemetry (
+      station_id, line, status, current_test, temperature_c, utilization_pct, pass_count, fail_count, heartbeat_at
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())
+    RETURNING id;
+    """
+    async with db_pool.acquire() as conn:
+        try:
+            rec = await conn.fetchrow(
+                sql,
+                payload.station_id,
+                payload.line,
+                payload.status,
+                payload.current_test,
+                payload.temperature_c,
+                payload.utilization_pct,
+                payload.pass_count,
+                payload.fail_count,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    return {"id": str(rec["id"])}
+
+# Run with: uvicorn app:app --host 0.0.0.0 --port 8000

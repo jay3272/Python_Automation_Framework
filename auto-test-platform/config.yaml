@@ -15,6 +15,15 @@ server:
   port: 5000
   max_runs: 100        # in-memory result buffer size
 
+supabase:
+  url: https://sfaemeaymubqqdlgpzxn.supabase.co
+  schema: public
+  publishable_key_env: SUPABASE_PUBLISHABLE_KEY
+  service_role_key_env: SUPABASE_SERVICE_ROLE_KEY
+  database_url: null           # keep null and set DATABASE_URL in .env instead
+  database_url_env: DATABASE_URL
+  station_id: ST-001
+
 retry:
   max_attempts: 3
   delay: 0.5           # initial back-off delay in seconds

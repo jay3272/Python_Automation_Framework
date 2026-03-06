@@ -1,0 +1,272 @@
+-- 1) Enable extension
+-- 用於 gen_random_uuid()
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- 2) Tables
+
+-- test_runs: 每次測試執行的 metadata / summary（外部系統帶入 run_id 做冪等檢查）
+CREATE TABLE IF NOT EXISTS public.test_runs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  run_id text NOT NULL UNIQUE, -- 外部系統提供，作為冪等 key
+  station_id text NOT NULL,
+  started_at timestamptz NOT NULL,
+  ended_at timestamptz,
+  summary_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- test_results: 每個測試項目的結果，參考 test_runs(id)
+CREATE TABLE IF NOT EXISTS public.test_results (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  run_id uuid NOT NULL REFERENCES public.test_runs(id) ON DELETE CASCADE,
+  test_name text NOT NULL,
+  status text NOT NULL CHECK (status IN ('passed','failed','error','skipped')),
+  duration_sec numeric(10,4) NOT NULL DEFAULT 0,
+  error_text text,
+  received_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- station_telemetry: 站台即時狀態/Telemetry (用於 Dashboard 顯示 online/heartbeat 等)
+CREATE TABLE IF NOT EXISTS public.station_telemetry (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  station_id text NOT NULL,
+  line text,
+  status text NOT NULL CHECK (status IN ('idle','running','warning','offline')),
+  current_test text,
+  temperature_c numeric(5,2),
+  utilization_pct numeric(5,2),
+  pass_count integer NOT NULL DEFAULT 0,
+  fail_count integer NOT NULL DEFAULT 0,
+  heartbeat_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- 3) Indexes
+-- 用於 Dashboard 常見查詢與排序，加速搜尋與避免全表掃描
+
+-- test_runs created_at desc: 建立普通 index (Postgres 無法直接指定 desc in index for planner usage? We create explicit index with desc)
+CREATE INDEX IF NOT EXISTS idx_test_runs_created_at_desc ON public.test_runs (created_at DESC);
+
+-- test_runs station_id + created_at desc
+CREATE INDEX IF NOT EXISTS idx_test_runs_station_created_at_desc ON public.test_runs (station_id, created_at DESC);
+
+-- test_results run_id + received_at desc
+CREATE INDEX IF NOT EXISTS idx_test_results_run_received_at_desc ON public.test_results (run_id, received_at DESC);
+
+-- test_results status + received_at desc
+CREATE INDEX IF NOT EXISTS idx_test_results_status_received_at_desc ON public.test_results (status, received_at DESC);
+
+-- station_telemetry station_id + heartbeat_at desc
+CREATE INDEX IF NOT EXISTS idx_station_telemetry_station_heartbeat_desc ON public.station_telemetry (station_id, heartbeat_at DESC);
+
+-- station_telemetry status + heartbeat_at desc
+CREATE INDEX IF NOT EXISTS idx_station_telemetry_status_heartbeat_desc ON public.station_telemetry (status, heartbeat_at DESC);
+
+-- 4) Views for Dashboard
+
+-- v_latest_station_status: 每個 station_id 最新一筆 heartbeat（使用 DISTINCT ON for simplicity & performance with proper index）
+CREATE OR REPLACE VIEW public.v_latest_station_status AS
+SELECT DISTINCT ON (station_id)
+  id,
+  station_id,
+  line,
+  status,
+  current_test,
+  temperature_c,
+  utilization_pct,
+  pass_count,
+  fail_count,
+  heartbeat_at
+FROM public.station_telemetry
+ORDER BY station_id, heartbeat_at DESC;
+
+-- v_recent_test_results: 關聯 test_results + test_runs，帶出 station_id，預設用 received_at desc 排序
+CREATE OR REPLACE VIEW public.v_recent_test_results AS
+SELECT
+  tr.id AS result_id,
+  tr.run_id,
+  tr.test_name,
+  tr.status,
+  tr.duration_sec,
+  tr.error_text,
+  tr.received_at,
+  runs.station_id,
+  runs.run_id AS external_run_id,
+  runs.started_at,
+  runs.ended_at,
+  runs.summary_json
+FROM public.test_results tr
+JOIN public.test_runs runs ON tr.run_id = runs.id
+ORDER BY tr.received_at DESC;
+
+-- 5) RLS and Permissions
+
+-- Enable RLS on the three tables (if not already)
+ALTER TABLE public.test_runs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.test_results ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.station_telemetry ENABLE ROW LEVEL SECURITY;
+
+-- Revoke broad privileges from public for safety (idempotent pattern)
+REVOKE ALL ON public.test_runs FROM PUBLIC;
+REVOKE ALL ON public.test_results FROM PUBLIC;
+REVOKE ALL ON public.station_telemetry FROM PUBLIC;
+
+-- Grant SELECT to authenticated role (so dashboard clients authenticated can read)
+GRANT SELECT ON public.test_runs TO authenticated;
+GRANT SELECT ON public.test_results TO authenticated;
+GRANT SELECT ON public.station_telemetry TO authenticated;
+
+-- Grant full privileges to service_role (service_role typically uses SUPABASE_SERVICE_ROLE_KEY)
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.test_runs TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.test_results TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.station_telemetry TO service_role;
+
+-- Policies:
+-- 1) authenticated can SELECT (read) all rows
+-- 2) service_role can do all operations (we grant TO role service_role and allow true in policy so service role can bypass RLS when using service key; still we define explicit policies)
+
+-- Note: service_role bypasses RLS by default when using the service role key; policies added for clarity.
+
+-- Policies for test_runs
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE schemaname = 'public' AND tablename = 'test_runs' AND policyname = 'select_authenticated_test_runs'
+  ) THEN
+    CREATE POLICY select_authenticated_test_runs ON public.test_runs
+      FOR SELECT
+      TO authenticated
+      USING (true);
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE schemaname = 'public' AND tablename = 'test_runs' AND policyname = 'service_role_full_access_test_runs'
+  ) THEN
+    CREATE POLICY service_role_full_access_test_runs ON public.test_runs
+      FOR ALL
+      TO service_role
+      USING (true)
+      WITH CHECK (true);
+  END IF;
+END
+$$;
+
+-- Policies for test_results
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE schemaname = 'public' AND tablename = 'test_results' AND policyname = 'select_authenticated_test_results'
+  ) THEN
+    CREATE POLICY select_authenticated_test_results ON public.test_results
+      FOR SELECT
+      TO authenticated
+      USING (true);
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE schemaname = 'public' AND tablename = 'test_results' AND policyname = 'service_role_full_access_test_results'
+  ) THEN
+    CREATE POLICY service_role_full_access_test_results ON public.test_results
+      FOR ALL
+      TO service_role
+      USING (true)
+      WITH CHECK (true);
+  END IF;
+END
+$$;
+
+-- Policies for station_telemetry
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE schemaname = 'public' AND tablename = 'station_telemetry' AND policyname = 'select_authenticated_station_telemetry'
+  ) THEN
+    CREATE POLICY select_authenticated_station_telemetry ON public.station_telemetry
+      FOR SELECT
+      TO authenticated
+      USING (true);
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE schemaname = 'public' AND tablename = 'station_telemetry' AND policyname = 'service_role_full_access_station_telemetry'
+  ) THEN
+    CREATE POLICY service_role_full_access_station_telemetry ON public.station_telemetry
+      FOR ALL
+      TO service_role
+      USING (true)
+      WITH CHECK (true);
+  END IF;
+END
+$$;
+
+-- 6) Insert sample test data (2~3 rows per table) for verification.
+-- Use INSERT ... ON CONFLICT DO NOTHING to make script re-runnable.
+
+-- Sample test_runs
+INSERT INTO public.test_runs (run_id, station_id, started_at, ended_at, summary_json)
+VALUES
+  ('ext-run-001', 'station-A', now() - interval '10 minutes', now() - interval '9 minutes', '{"summary":"smoke test","total":3}'::jsonb)
+ON CONFLICT (run_id) DO NOTHING;
+
+INSERT INTO public.test_runs (run_id, station_id, started_at, ended_at, summary_json)
+VALUES
+  ('ext-run-002', 'station-B', now() - interval '20 minutes', now() - interval '18 minutes', '{"summary":"regression","total":12}'::jsonb)
+ON CONFLICT (run_id) DO NOTHING;
+
+INSERT INTO public.test_runs (run_id, station_id, started_at, ended_at, summary_json)
+VALUES
+  ('ext-run-003', 'station-A', now() - interval '5 minutes', NULL, '{"summary":"running","total":5}'::jsonb)
+ON CONFLICT (run_id) DO NOTHING;
+
+-- Ensure we have IDs for runs to reference in test_results sample.
+-- We'll select the ids into WITH queries for idempotent inserts.
+
+WITH r1 AS (
+  SELECT id FROM public.test_runs WHERE run_id = 'ext-run-001' LIMIT 1
+),
+r2 AS (
+  SELECT id FROM public.test_runs WHERE run_id = 'ext-run-002' LIMIT 1
+),
+r3 AS (
+  SELECT id FROM public.test_runs WHERE run_id = 'ext-run-003' LIMIT 1
+)
+INSERT INTO public.test_results (run_id, test_name, status, duration_sec, error_text, received_at)
+SELECT r1.id, 'login:endpoint', 'passed', 0.2345, NULL, now() - interval '9 minutes'
+FROM r1
+ON CONFLICT DO NOTHING;
+
+WITH r AS (SELECT id FROM public.test_runs WHERE run_id = 'ext-run-001' LIMIT 1)
+INSERT INTO public.test_results (run_id, test_name, status, duration_sec, error_text, received_at)
+SELECT r.id, 'api:create_record', 'failed', 1.3456, 'timeout connecting to service', now() - interval '9 minutes 30 seconds'
+FROM r
+ON CONFLICT DO NOTHING;
+
+WITH r AS (SELECT id FROM public.test_runs WHERE run_id = 'ext-run-002' LIMIT 1)
+INSERT INTO public.test_results (run_id, test_name, status, duration_sec, error_text, received_at)
+SELECT r.id, 'ui:flow1', 'passed', 2.5000, NULL, now() - interval '18 minutes'
+FROM r
+ON CONFLICT DO NOTHING;
+
+-- station_telemetry sample rows
+INSERT INTO public.station_telemetry (station_id, line, status, current_test, temperature_c, utilization_pct, pass_count, fail_count, heartbeat_at)
+VALUES
+  ('station-A', 'line-1', 'running', 'test-suite-42', 36.50, 72.25, 120, 3, now() - interval '30 seconds')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO public.station_telemetry (station_id, line, status, current_test, temperature_c, utilization_pct, pass_count, fail_count, heartbeat_at)
+VALUES
+  ('station-B', 'line-2', 'idle', NULL, 28.10, 5.00, 300, 10, now() - interval '2 minutes')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO public.station_telemetry (station_id, line, status, current_test, temperature_c, utilization_pct, pass_count, fail_count, heartbeat_at)
+VALUES
+  ('station-C', 'line-1', 'warning', 'watchdog', 45.00, 90.00, 50, 5, now() - interval '1 minute')
+ON CONFLICT DO NOTHING;
+
+-- A small validation comment: Creating sample test_results may depend on test_runs existing; we inserted runs first.
+-- End of SQL script.
